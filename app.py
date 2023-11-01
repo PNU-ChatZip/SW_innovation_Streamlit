@@ -82,7 +82,6 @@ sample_data = {
     'detail_location': ['부산광역시 중구 대청동 1-1', '부산광역시 중구 대청동 1-2', '부산광역시 중구 대청동 1-3'],
     'location': [(random.uniform(35.05, 35.20), random.uniform(128.97, 129.15)) for _ in range(100)]
 }
-@st.cache(allow_output_mutation=True)
 def init_district_data():
     if 'page' not in st.session_state:
         st.session_state.page = 0
