@@ -14,6 +14,8 @@ from io import BytesIO
 from geopy.geocoders import Nominatim
 
 import requests
+import threading
+import time
 
 # 경고 메시지 숨기기
 st.set_option('deprecation.showPyplotGlobalUse', False)
@@ -118,6 +120,7 @@ def init_district_data():
         accidents_df = st.session_state['accidents_df']
         district_data = st.session_state['districts_data']
         yi4326 = st.session_state['yi4326']
+
 
 def get_average_center(district_names):
     latitudes = [districts_centers[district][0] for district in district_names]
@@ -229,11 +232,11 @@ def create_map(data, district_name=None, marker=False):
                         }}
                     </style>
 
-                    <button class="complete-button" onclick="sendGetRequest({accident['id']},'{acc_dict[accident['category']]}','finished')">
+                    <button class="complete-button" onclick="sendGetRequest({accident['id']},'{acc_dict[accident['category']]}','finished'); alert('완료처리되었습니다.');">
                         <span class="button-icon">&#10004;</span> 완료
                     </button>
                     
-                    <button class="hold-button" onclick="sendGetRequest({accident['id']},'{acc_dict[accident['category']]}','checked')">
+                    <button class="hold-button" onclick="sendGetRequest({accident['id']},'{acc_dict[accident['category']]}','checked');  alert('확인 처리되었습니다.');">
                         <span class="button-icon">&#9888;</span> 확인
                     </button>
                     
