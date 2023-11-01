@@ -43,7 +43,9 @@ districts_centers = {
 }
 
 ACCIDENT_DATA_URL = "http://waterboom.iptime.org:1101/receive-accident-location"
-@st.cache_data
+FORTHOLE_DATA_URL = "http://waterboom.iptime.org:1101/receive-forthole-location"
+
+
 def fetch_and_format_accident_data(url):
     response = requests.get(url)
     if response.status_code == 200:
@@ -56,7 +58,7 @@ def fetch_and_format_accident_data(url):
         formatted_df = pd.DataFrame({
             'id' : accidents_df['id'],
             'type': accidents_df['progress'],
-            'category': ['교통사고' for _ in range(len(accidents_df))],  # 모든 사고를 '교통사고'로 카테고리 지정
+            'category': accidents_df['type'],  
             'date': pd.to_datetime(accidents_df['time']),  # 'time'을 datetime 형식으로 변환
             'district': accidents_df['area2'],  # 'district'는 'area2' 값 사용
             'description': accidents_df['type'],  # 'description'은 'type' 값 사용
@@ -73,14 +75,14 @@ def fetch_and_format_accident_data(url):
 sample_data = {
     'id':[1,2,3],
     'type':['discoverd', 'checked', 'finished'],
-    'category': ['교통사고', '교통체증', '포트홀'],
+    'category': ['차량 사고', '도로 막힘', '포트홀'],
     'date': pd.date_range(start="2023-01-01", periods=100, freq='D').to_pydatetime().tolist(),
     'district': random.choices(busan_districts, k=100),
     'description': ['사고 발생', '체증 심함', '포트홀 발생'],
     'detail_location': ['부산광역시 중구 대청동 1-1', '부산광역시 중구 대청동 1-2', '부산광역시 중구 대청동 1-3'],
     'location': [(random.uniform(35.05, 35.20), random.uniform(128.97, 129.15)) for _ in range(100)]
 }
-@st.cache_data
+@st.cache(allow_output_mutation=True)
 def init_district_data():
     if 'page' not in st.session_state:
         st.session_state.page = 0
@@ -88,7 +90,8 @@ def init_district_data():
     if 'init_data_loaded' not in st.session_state:
         # DataFrame 생성
         accidents_df = fetch_and_format_accident_data(ACCIDENT_DATA_URL)
-        
+        forthole_df = fetch_and_format_accident_data(FORTHOLE_DATA_URL)
+        accidents_df = pd.concat([accidents_df, forthole_df])
         st.session_state['districts_data'] = {
         '중구': ['26110'],
         '서구': ['26140'],
@@ -125,11 +128,10 @@ def get_average_center(district_names):
     return (avg_lat, avg_lng)
 
 # 지도 생성 함수
-@st.cache_resource
 def create_map(data, district_name=None, marker=False):
     category_color_map = {
-        '교통사고': 'red',
-        '교통체증': 'orange',
+        '차량 사고': 'red',
+        '도로 막힘': 'orange',
         '포트홀': 'blue'
     }
     with st.spinner('Wait for it...'):
@@ -158,20 +160,11 @@ def create_map(data, district_name=None, marker=False):
                 geojson.add_child(folium.Tooltip(row['EMD_NM']))
                 geojson.add_to(m)
 
-        # js = """{var xhttp = new XMLHttpRequest();
-        #             xhttp.onreadystatechange = function() {
-        #                 if (this.readyState == 4 && this.status == 200) {
-        #                     console.log('Response:', this.responseText);
-        #                 }
-        #             };
-        #             xhttp.open('GET', 'test', true);}"""
-        js = """{fetch('test')}"""
         
-        acc_dict = {'교통사고':'accident', '교통체증':'traffic_jam', '포트홀':'forthole'}
+        acc_dict = {'차량 사고':'accident', '도로 막힘':'traffic_jam', '포트홀':'forthole'}
         status_description = {'finished':'완료', 'checked':'확인', 'discovered':'발견'}
-
         for _, accident in data.iterrows():
-            icon_color = category_color_map.get(accident['category'], 'gray')  # 카테고리별 색상을 얻음, 기본은 회색
+            icon_color = category_color_map[accident['category']]  # 카테고리별 색상을 얻음, 기본은 회색
             icon = folium.Icon(color=icon_color)
             status_class = {
             'finished': 'status-complete',
