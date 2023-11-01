@@ -1,5 +1,7 @@
 from folium.map import Marker
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
+import geopandas as gpd
 
 import streamlit as st
 import folium
@@ -8,14 +10,14 @@ from folium import IFrame
 
 import pandas as pd
 import random
-
+from io import BytesIO
 from geopy.geocoders import Nominatim
 
-def geocoding_reverse(lat_lng_str): 
-    geolocoder = Nominatim(user_agent = 'South Korea', timeout=None)
-    address = geolocoder.reverse(lat_lng_str)
+import requests
 
-    return address
+# 경고 메시지 숨기기
+st.set_option('deprecation.showPyplotGlobalUse', False)
+st.set_page_config(layout="wide")
 
 # 부산의 구 리스트
 busan_districts = [
@@ -40,33 +42,80 @@ districts_centers = {
     '사상구': (35.14946667, 128.9933333)
 }
 
+ACCIDENT_DATA_URL = "http://waterboom.iptime.org:1101/receive-accident-location"
+@st.cache_data
+def fetch_and_format_accident_data(url):
+    response = requests.get(url)
+    if response.status_code == 200:
+        # 실제 데이터를 JSON 형태로 변환
+        data = response.json()
+        # JSON 데이터를 DataFrame으로 변환
+        accidents_df = pd.DataFrame(data)
+        
+        # 샘플 데이터 형식에 맞추어 컬럼 변환
+        formatted_df = pd.DataFrame({
+            'id' : accidents_df['id'],
+            'type': accidents_df['progress'],
+            'category': ['교통사고' for _ in range(len(accidents_df))],  # 모든 사고를 '교통사고'로 카테고리 지정
+            'date': pd.to_datetime(accidents_df['time']),  # 'time'을 datetime 형식으로 변환
+            'district': accidents_df['area2'],  # 'district'는 'area2' 값 사용
+            'description': accidents_df['type'],  # 'description'은 'type' 값 사용
+            'detail_location': accidents_df['road'],
+            'location': list(zip(accidents_df['latitude'], accidents_df['longitude']))  # 'location'은 'latitude'와 'longitude'를 튜플로 묶음
+        })
+        return formatted_df
+    else:
+        st.error("Failed to fetch data")
+        return pd.DataFrame()
+
 
 # 샘플 데이터 생성
 sample_data = {
+    'id':[1,2,3],
+    'type':['discoverd', 'checked', 'finished'],
     'category': ['교통사고', '교통체증', '포트홀'],
     'date': pd.date_range(start="2023-01-01", periods=100, freq='D').to_pydatetime().tolist(),
     'district': random.choices(busan_districts, k=100),
     'description': ['사고 발생', '체증 심함', '포트홀 발생'],
+    'detail_location': ['부산광역시 중구 대청동 1-1', '부산광역시 중구 대청동 1-2', '부산광역시 중구 대청동 1-3'],
     'location': [(random.uniform(35.05, 35.20), random.uniform(128.97, 129.15)) for _ in range(100)]
 }
+@st.cache_data
+def init_district_data():
+    if 'page' not in st.session_state:
+        st.session_state.page = 0
+    
+    if 'init_data_loaded' not in st.session_state:
+        # DataFrame 생성
+        accidents_df = fetch_and_format_accident_data(ACCIDENT_DATA_URL)
+        
+        st.session_state['districts_data'] = {
+        '중구': ['26110'],
+        '서구': ['26140'],
+        '동구': ['26170'],
+        '영도구': ['26200'],
+        '부산진구': ['26230'],
+        '동래구': ['26260'],
+        '남구': ['26290'],
+        '북구': ['26320'],
+        '해운대구': ['26350'],
+        '사하구': ['26380'],
+        '금정구': ['26410'],
+        '강서구': ['26440'],
+        '연제구': ['26470'],
+        '수영구': ['26500']
+        }
+        EMD = gpd.read_file('LSMD_ADM_SECT_UMD_26_202309.shp', encoding='cp949')
+        st.session_state.yi4326 = EMD.to_crs(epsg=4326)
 
-if 'init_data_loaded' not in st.session_state:
-    # DataFrame 생성
-    accidents_df = pd.DataFrame({
-        'category': random.choices(sample_data['category'], k=100),
-        'date': random.choices(sample_data['date'], k=100),
-        'district': random.choices(sample_data['district'], k=100),
-        'description': random.choices(sample_data['description'], k=100),
-        'location': sample_data['location']
-    })
-    address = geocoding_reverse('35.22055713598362, 129.08256383249707')
-    print(address)
-    # 세션 상태에 데이터 저장
-    st.session_state['accidents_df'] = accidents_df
-    st.session_state['init_data_loaded'] = True
-else:
-    # 세션 상태에서 데이터 로드
-    accidents_df = st.session_state['accidents_df']
+        # 세션 상태에 데이터 저장
+        st.session_state['accidents_df'] = accidents_df
+        st.session_state['init_data_loaded'] = True
+    else:
+        # 세션 상태에서 데이터 로드
+        accidents_df = st.session_state['accidents_df']
+        district_data = st.session_state['districts_data']
+        yi4326 = st.session_state['yi4326']
 
 def get_average_center(district_names):
     latitudes = [districts_centers[district][0] for district in district_names]
@@ -76,111 +125,273 @@ def get_average_center(district_names):
     return (avg_lat, avg_lng)
 
 # 지도 생성 함수
-def create_map(data, district_name=None):
-    # 만약 특정 지역구가 선택되면 해당 지역구의 중심으로 지도 중심 설정
-    if district_name and all(name in districts_centers for name in district_name):
-        center_location = get_average_center(district_name)
-        m = folium.Map(location=center_location, zoom_start=13.5)  # zoom level은 적절히 조정
-    else:
-        m = folium.Map(location=[35.15, 129.05], zoom_start=11)
+@st.cache_resource
+def create_map(data, district_name=None, marker=False):
+    category_color_map = {
+        '교통사고': 'red',
+        '교통체증': 'orange',
+        '포트홀': 'blue'
+    }
+    with st.spinner('Wait for it...'):
+        # 만약 특정 지역구가 선택되면 해당 지역구의 중심으로 지도 중심 설정
+        if district_name and all(name in districts_centers for name in district_name):
+            center_location = get_average_center(district_name)
+            m = folium.Map(location=center_location, zoom_start=13.5)  # zoom level은 적절히 조정
+        else:
+            m = folium.Map(location=[35.15, 129.05], zoom_start=11)
+        
+        if marker==1:    
+            category_clusters = {category: MarkerCluster(name=category) for category in category_color_map}
 
-    for _, accident in data.iterrows():
-        iframe = folium.IFrame(html=f"""
-        <div style="font-family: Arial; text-align: center;">
-            <h4>{accident['category']} 사고</h4>
-            <hr style="margin: 1px;">
-            <p><strong>날짜:</strong> {accident['date'].strftime('%Y-%m-%d')}</p>
-            <p><strong>시군구:</strong> {accident['district']}</p>
-            <p><strong>설명:</strong> {accident['description']}</p>
-        </div>
-        """, width=200, height=200)
-        popup = folium.Popup(iframe, max_width=2650)
-        folium.Marker(
-            location=accident['location'],
-            popup=popup,
-            tooltip=f"{accident['category']} - {accident['date'].strftime('%Y-%m-%d')}"
-        ).add_to(m)
+        if district_name:
+            # 각 지역구에 속하는 행정동 리스트 추출
+            dong_list = []
+            for district in district_name:
+                dong_list.extend(st.session_state['districts_data'].get(district, []))
+            dong_geo = st.session_state['yi4326'][st.session_state['yi4326']['COL_ADM_SE'].isin(dong_list)]
+            for _, row in dong_geo.iterrows():
+                geojson = folium.GeoJson(
+                    row['geometry'],
+                    name=row['EMD_NM'],
+                    style_function=lambda x: {'fillColor': 'green', 'color': 'green', 'weight': 2, 'fillOpacity': 0.1}
+                )
+                geojson.add_child(folium.Tooltip(row['EMD_NM']))
+                geojson.add_to(m)
+
+        # js = """{var xhttp = new XMLHttpRequest();
+        #             xhttp.onreadystatechange = function() {
+        #                 if (this.readyState == 4 && this.status == 200) {
+        #                     console.log('Response:', this.responseText);
+        #                 }
+        #             };
+        #             xhttp.open('GET', 'test', true);}"""
+        js = """{fetch('test')}"""
+        
+        acc_dict = {'교통사고':'accident', '교통체증':'traffic_jam', '포트홀':'forthole'}
+        status_description = {'finished':'완료', 'checked':'확인', 'discovered':'발견'}
+
+        for _, accident in data.iterrows():
+            icon_color = category_color_map.get(accident['category'], 'gray')  # 카테고리별 색상을 얻음, 기본은 회색
+            icon = folium.Icon(color=icon_color)
+            status_class = {
+            'finished': 'status-complete',
+            'checked': 'status-hold',
+            'discovered': 'status-pending'
+            }[accident['type']]
+            iframe = folium.IFrame(html=f"""
+            <div>
+                <style>
+                    .status-indicator {{
+                        height: 10px;
+                        width: 10px;
+                        background-color: #bbb;
+                        border-radius: 50%;
+                        display: inline-block;
+                    }}
+                    .status-complete {{ background-color: #4CAF50; }} /* Green */
+                    .status-hold {{ background-color: #FFEB3B; }} /* Yellow */
+                    .status-pending {{ background-color: #F44336; }} /* Red */
+                </style>
+            </div>
+                <span class="status-indicator {status_class}"></span>
+                <span class="status-description">{status_description[accident['type']]}</span>
+            <div style="font-family: Arial; text-align: center;">
+                <h4>{accident['category']} 사고</h4>
+                <hr style="margin: 1px;">
+                <p><strong>날짜:</strong> {accident['date'].strftime('%Y-%m-%d')}</p>
+                <p><strong>시군구:</strong> {accident['district']}</p>
+                <p><strong>설명:</strong> {accident['description']}</p>
+                <div>
+                    <style>
+                        .complete-button {{
+                            padding: 10px 15px;
+                            background-color: #4CAF50; /* Green */
+                            color: white;
+                            border: none;
+                            border-radius: 5px;
+                            cursor: pointer;
+                            font-family: Arial;
+                            margin-right: 5px; /* Add some space between the buttons */
+                        }}
+
+                        .hold-button {{
+                            padding: 10px 15px;
+                            background-color: #FF9800; /* Orange */
+                            color: white;
+                            border: none;
+                            border-radius: 5px;
+                            cursor: pointer;
+                            font-family: Arial;
+                        }}
+                        
+                        .complete-button:hover, .hold-button:hover {{
+                            opacity: 0.8;
+                        }}
+                        
+                        .complete-button:active, .hold-button:active {{
+                            opacity: 0.6;
+                        }}
+                        
+                        .button-icon {{
+                            padding-right: 5px;
+                        }}
+                    </style>
+
+                    <button class="complete-button" onclick="sendGetRequest({accident['id']},'{acc_dict[accident['category']]}','finished')">
+                        <span class="button-icon">&#10004;</span> 완료
+                    </button>
+                    
+                    <button class="hold-button" onclick="sendGetRequest({accident['id']},'{acc_dict[accident['category']]}','checked')">
+                        <span class="button-icon">&#9888;</span> 확인
+                    </button>
+                    
+                    <script>
+                    function sendGetRequest(id, type, progress) {{
+                        const url = `http://waterboom.iptime.org:1101/update-location-progress?id=${{id}}&type=${{type}}&progress=${{progress}}`;
+
+                        fetch(url)
+                        .then(response => {{
+                            if (!response.ok) {{
+                                throw new Error('Network response was not ok ' + response.statusText);
+                            }}
+                            return response.json();
+                        }})
+                        .then(data => {{
+                            console.log('Success:', data);
+                            // Handle success here
+                        }})
+                        .catch((error) => {{
+                            console.error('Error:', error);
+                            // Handle errors here
+                        }});
+                    }}
+                    </script>
+                </div>
+            """, width=200, height=200)
+            popup = folium.Popup(iframe, max_width=2650)
+            
+            if marker==0:
+                folium.CircleMarker(
+                location=accident['location'],
+                radius=4,  # Smaller size
+                color=icon_color,
+                fill=True,
+                fill_color=icon_color,
+                fill_opacity=0.8,
+                popup=popup,
+                icon=icon,
+                tooltip=f"{accident['category']} - {accident['date'].strftime('%Y-%m-%d')}"
+            ).add_to(m)
+            else:
+                folium.CircleMarker(
+                    location=accident['location'],
+                    radius=4,  # Smaller size
+                    color=icon_color,
+                    fill=True,
+                    fill_color=icon_color,
+                    fill_opacity=0.8,
+                    popup=popup,
+                    icon=icon,
+                    tooltip=f"{accident['category']} - {accident['date'].strftime('%Y-%m-%d')}"
+                ).add_to(category_clusters[accident['category']])
+                for cluster in category_clusters.values():
+                    cluster.add_to(m)
+
+        folium.LayerControl().add_to(m)
     return m
 
 def filter_accidents():
-    date_filter = st.session_state['date_range'] if len(st.session_state['date_range']) == 2 else None
+    date_filter = [pd.to_datetime(date).to_pydatetime() for date in st.session_state['date_range']] if len(st.session_state['date_range']) == 2 else None
     current_category = st.session_state['category_select_key']
     current_districts = st.session_state['districts_select_key']
     
+    category_condition = (st.session_state['accidents_df']['category'] == current_category) if current_category != '전체' else True
+    district_condition = st.session_state['accidents_df']['district'].isin(current_districts)
+    
     if current_category and current_districts:
         if date_filter:
-            return accidents_df[
-                (accidents_df['category'] == current_category if current_category != '전체' else True) &
-                (accidents_df['date'].between(date_filter[0], date_filter[1])) &
-                (accidents_df['district'].isin(current_districts))
-            ]
+            date_condition = (
+                (st.session_state['accidents_df']['date'] >= date_filter[0]) &
+                (st.session_state['accidents_df']['date'] <= date_filter[1])
+            )
+            return st.session_state['accidents_df'][category_condition & date_condition & district_condition]
         else:
-            return accidents_df[
-                (accidents_df['category'] == current_category if current_category != '전체' else True) &
-                (accidents_df['district'].isin(current_districts))
-            ]
+            return st.session_state['accidents_df'][category_condition & district_condition]
     else:
         return pd.DataFrame()
 
-# 사이드바 설정
-st.sidebar.title("사고 검색 옵션")
-category = st.sidebar.selectbox(
-    '사고 카테고리',
-    options=['전체'] + sample_data['category'],
-    key='category_select_key',
-    on_change=filter_accidents
-)
+def to_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+        # 변경된 부분: writer.save() 대신 writer.close() 사용
+    processed_data = output.getvalue()
 
-# 날짜 범위 선택
-if 'date_range' not in st.session_state:
-    st.session_state['date_range'] = []
+    return processed_data
 
-st.session_state['date_range'] = st.sidebar.date_input(
-    '날짜 범위 선택',
-    [],
-    key='date_range_key',
-    on_change=filter_accidents
-)
+def download_excel(df):
+    excel_file = to_excel(df)
+    st.download_button(
+        label="Download Excel file",
+        data=excel_file,
+        file_name="data.xlsx",
+        mime="application/vnd.ms-excel"
+    )
 
-# 시군구 선택
-selected_districts = st.sidebar.multiselect(
-    '시군구 선택',
-    options=busan_districts,
-    default=busan_districts,
-    key='districts_select_key',
-    on_change=filter_accidents
-)
+def main():
+    init_district_data()
+    # 사이드바 설정
+    st.sidebar.title("사고 검색 옵션")
+    category = st.sidebar.selectbox(
+        '사고 카테고리',
+        options=['전체'] + sample_data['category'],
+        key='category_select_key',
+        on_change=filter_accidents
+    )
 
-# CSS를 사용하여 사이드바의 너비를 조정
-st.markdown(
-    """
-    <style>
-    .css-1d391kg {
-        width: 350px; /* 원하는 너비로 설정 */
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+    # 날짜 범위 선택
+    if 'date_range' not in st.session_state:
+        st.session_state['date_range'] = []
 
-# 사이드바에 데이터프레임을 표시
-df = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [5, 6, 7, 8]})
-st.sidebar.dataframe(df)
+    st.session_state['date_range'] = st.sidebar.date_input(
+        '날짜 범위 선택',
+        [],
+        key='date_range_key',
+        on_change=filter_accidents
+    )
 
-st.markdown(
-    """
-    <script>
-        const sidebar = window.parent.document.querySelector('.sidebar .sidebar-collapse-control');
-        if (sidebar) {
-            sidebar.click();
-        }
-    </script>
-    """,
-    unsafe_allow_html=True
-)
+    # 시군구 선택
+    selected_districts = st.sidebar.multiselect(
+        '시군구 선택',
+        options=busan_districts,
+        default=busan_districts,
+        key='districts_select_key',
+        on_change=filter_accidents
+    )
+    st.title(" 🌐 B - MAP")
+    # 사이드바에 데이터프레임을 표시)
 
-filtered_data = filter_accidents()
-map_fig = create_map(filtered_data, district_name=st.session_state['districts_select_key'])
+    filtered_data = filter_accidents()
+    st.sidebar.write("Filtered Data", filtered_data)
+    
+    col1, col2, space, col3 = st.columns([1.2,1,2.2,2])
 
-st_folium(map_fig, width=725)
+    # 첫 번째 열에 "전체 데이터 보기" 버튼 배치
+    with col1:
+        if st.button("전체 데이터 보기"):
+            st.session_state.page = 0
 
+    # 두 번째 열에 "클러스터 보기" 버튼 배치
+    with col2:
+        if st.button("클러스터 보기"):
+            st.session_state.page = 1
+
+    # 세 번째 열에 엑셀 다운로드 버튼 배치
+    with col3:
+        download_excel(filtered_data)
+
+    map_fig = create_map(filtered_data, district_name=st.session_state['districts_select_key'],marker=st.session_state.page)
+
+    st_folium(map_fig, width='100%')
+if __name__ == '__main__':
+    main()
