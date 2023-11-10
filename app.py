@@ -9,6 +9,7 @@ import pandas as pd
 from datetime import datetime, time
 
 import geopandas as gpd
+from shapely.geometry import Point
 from geopy.geocoders import Nominatim
 
 import requests
@@ -61,7 +62,6 @@ def init_district_data():
     if 'page' not in st.session_state:
         st.session_state.page = 0
     
-    # 날짜 범위 선택
     if 'date_range' not in st.session_state:
         st.session_state['date_range'] = []
 
@@ -70,7 +70,14 @@ def init_district_data():
     
     if 'type_filter' not in st.session_state:
         st.session_state['type_filter'] = process_types
+    
+    if 'category_select_key' not in st.session_state:
+        st.session_state['category_select_key'] = '전체'
         
+    if 'districts_select_key' not in st.session_state:
+        st.session_state['districts_select_key'] = daegu_districts
+    
+    
     for status in process_types:
         key = f'type_filter_{status}'
         if key not in st.session_state:
@@ -85,8 +92,19 @@ def init_district_data():
         #accidents_df = get_sample_data(0,50)
         accidents_df = fetch_and_format_accident_data(ACCIDENT_DATA_URL)
         
+        traffic_df = pd.read_csv('traffic_data.csv')
+        traffic_df = traffic_df.sort_values(by=['Complexity'],ascending=False)
+
+        st.session_state['traffic_df'] = traffic_df
+        
+        analyze_df = pd.DataFrame()
+        st.session_state['analyze_df'] = analyze_df
+        
         EMD = gpd.read_file('LSMD_ADM_SECT_UMD_daegu\LSMD_ADM_SECT_UMD_27_202309.shp', encoding='cp949')
         st.session_state['yi4326'] = EMD.to_crs(epsg=4326)
+
+        caution_df = traffic_df[:10]
+        st.session_state['caution_df'] = caution_df
 
         # 세션 상태에 데이터 저장
         st.session_state['accidents_df'] = accidents_df
@@ -99,6 +117,8 @@ def init_district_data():
 # 지도 생성 함수
 def create_map(data, district_name=None, marker=False):
     clusters = {}
+    tiles = "http://mt0.google.com/vt/lyrs=p&hl=ko&x={x}&y={y}&z={z}"
+    attr = "Google"
     with st.spinner('Wait for it...'):
         # 만약 특정 지역구가 선택되면 해당 지역구의 중심으로 지도 중심 설정
         if district_name and all(name in districts_centers for name in district_name):
@@ -129,6 +149,17 @@ def create_map(data, district_name=None, marker=False):
                 geojson.add_child(folium.Tooltip(row['EMD_NM']))
                 geojson.add_to(m)
         
+        for _, caution in st.session_state['caution_df'].iterrows():
+            folium.Circle(
+                location=[caution['center_latitude'], caution['center_longitude']],
+                radius=caution['Complexity']*70,
+                color='#FFA07A',
+                fill=True,
+                fill_color='#FFA07A',
+                fill_opacity=0.5,
+                tooltip="교통혼잡"
+            ).add_to(m)
+        
         for _, accident in data.iterrows():
             icon_color = category_color_map[accident['category']]
             icon_opacity = status_opacity_map[accident['type']]
@@ -156,7 +187,7 @@ def create_map(data, district_name=None, marker=False):
                     location=accident['location'],
                     popup=popup,
                     icon=icon,
-                    tooltip=f"{accident['category']} - {accident['date'].strftime('%Y-%m-%d')}",
+                    tooltip=f"{accident['id']}:{accident['category']} - {accident['date'].strftime('%Y-%m-%d')}",
                     opacity=icon_opacity
                 ).add_to(m)
 
@@ -177,6 +208,7 @@ def filter_accidents():
             current_time_range = st.session_state['time_range']
             
             time_condition = (df['time'] >= current_time_range[0]) & (df['time'] <= current_time_range[1])
+            
             date_condition = (df['date'] >= date_filter[0]) & (df['date'] <= date_filter[1]) if date_filter else True
             category_condition = (df['category'] == current_category) if current_category != '전체' else True
             district_condition = df['district'].isin(current_districts)
@@ -206,6 +238,40 @@ def update_type_filter():
 
 def select_all_districts():
     st.session_state['districts_select_key'] = daegu_districts
+
+def analyze_priority(df):
+    traffic_df = st.session_state['traffic_df']
+    traffic_df = traffic_df[['center_longitude','center_latitude','Complexity']]
+    traffic_gdf = gpd.GeoDataFrame(
+        traffic_df, 
+        geometry=gpd.points_from_xy(traffic_df.center_longitude, traffic_df.center_latitude)
+    )
+    traffic_gdf.crs = "EPSG:4326"
+    df['latitude'] = df['location'].apply(lambda x: x[0])
+    df['longitude'] = df['location'].apply(lambda x: x[1])
+    gdf = gpd.GeoDataFrame(
+    df, 
+    geometry=gpd.points_from_xy(df.longitude, df.latitude)
+    )
+    gdf.crs = "EPSG:4326"
+    traffic_gdf.sindex
+    
+    for idx, accident in gdf.iterrows():
+        # nearest 메서드로부터 반환된 첫 번째 배열을 가져옵니다.
+        possible_matches_index = list(traffic_gdf.sindex.nearest(accident.geometry,max_distance=0.005))
+        complexity = 0
+        for traffic_idx in possible_matches_index[1][:3]:  # 가장 가까운 3개의 항목을 가져옵니다.
+            near = traffic_gdf.iloc[traffic_idx]
+            complexity += near['Complexity']
+        if possible_matches_index:
+            complexity /= len(possible_matches_index)
+        
+        gdf.at[idx, 'traffic_complexity'] = complexity
+    df = pd.DataFrame(gdf.drop(columns=['geometry','longitude','latitude']))
+    df = df[['traffic_complexity','user_id','id','type','category','date','district','description','detail_location','location']]
+    df = df.sort_values(by=['traffic_complexity'],ascending=False)
+    st.session_state['analyze_df'] = df
+    return st.session_state['analyze_df']
 
 def main():
     init_district_data()
@@ -257,6 +323,8 @@ def main():
     filtered_data = filter_accidents()
     if not filtered_data.empty:
         st.sidebar.write("선택된 시간대:", st.session_state['time_range'][0], "부터", st.session_state['time_range'][1], "까지")
+        if st.sidebar.button("처리 우선순위 분석"):
+            st.session_state['priority'] =True
         st.sidebar.write(f"검색된 데이터 : {len(filtered_data)} 개", filtered_data)
     else:
         st.sidebar.write("필터 조건에 맞는 데이터가 없습니다.")
@@ -277,9 +345,16 @@ def main():
     with col3:
         download_excel(filtered_data)
 
+    #범례
+    st.write("**※🚗:차량 사고,⌛:도로 정체,🔧:포트홀 / 작업 진행상태에 따라 투명화**")
     map_fig = create_map(filtered_data, district_name=st.session_state['districts_select_key'],marker=st.session_state.page)
 
     st_folium(map_fig, width='100%')
+    
+    if st.session_state.get('priority',False):
+        st.write("**📋 교통 혼잡도 기반 처리 우선순위 분석 결과**")
+        st.dataframe(analyze_priority(filtered_data))
+        st.session_state['priority'] = False
     
     #components.html(typebot_iframe_html, height=600)
 
